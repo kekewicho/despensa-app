@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+/* El resto de tu CSS personalizado va abajo */
+
+/* Opcional: Ocultar scrollbar para los filtros horizontales */
+.scrollbar-hide::-webkit-scrollbar {
+    display: none;
+}
+.scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
