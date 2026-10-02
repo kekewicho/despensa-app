@@ -23,8 +23,33 @@ import {
   List, 
   Plus, 
   Trash2, 
-  X 
+  X,
+  ClipboardPaste,
+  Copy,
+  Check,
+  Sparkles,
+  AlertCircle,
+  FileCode
 } from 'lucide-react';
+
+const GEMINI_PROMPT_TEMPLATE = `Formatea la lista de despensa e ingredientes/menú estrictamente como JSON válido sin ningún texto explicativo ni marcas de código markdown, usando esta estructura:
+
+{
+  "despensa": [
+    { "articulo": "Nombre del articulo", "cantidad": 1, "unidad": "pz", "origen": "Walmart" }
+  ],
+  "menu": [
+    {
+      "nombre": "Nombre del Platillo",
+      "ingredientes": [
+        { "nombre": "Ingrediente 1", "cantidad": "1", "unidad": "kg" }
+      ]
+    }
+  ]
+}
+
+Por favor convierte las siguientes notas/compras:
+`;
 
 function App() {
   // --- ESTADOS PRINCIPALES ---
@@ -40,6 +65,14 @@ function App() {
   const [showMenuModal, setShowMenuModal] = useState(false);
   const [showIngredientModal, setShowIngredientModal] = useState(false);
   
+  // Modal de Clipboard / JSON Parser
+  const [showClipboardModal, setShowClipboardModal] = useState(false);
+  const [jsonInput, setJsonInput] = useState('');
+  const [importMode, setImportMode] = useState('append'); // 'append' | 'replace'
+  const [importTarget, setImportTarget] = useState('auto'); // 'auto' | 'despensa' | 'menu'
+  const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [parseStatus, setParseStatus] = useState({ valid: false, error: '', despensaCount: 0, menuCount: 0, parsedData: null });
+
   // Formulario Despensa
   const [newPantryItem, setNewPantryItem] = useState({ articulo: '', cantidad: 1, unidad: 'pz', origen: 'Walmart' });
   
@@ -61,8 +94,83 @@ function App() {
     return () => { unsubPantry(); unsubMenu(); };
   }, []);
 
-  // --- 2. ACCIONES DE DESPENSA (Add/Delete/Toggle) ---
+  // --- 2. ANALIZADOR / PARSER DE JSON EN TIEMPO REAL ---
+  useEffect(() => {
+    if (!jsonInput.trim()) {
+      setParseStatus({ valid: false, error: '', despensaCount: 0, menuCount: 0, parsedData: null });
+      return;
+    }
 
+    try {
+      let rawText = jsonInput.trim();
+      // Eliminar delimitadores de bloques de código markdown si los hay
+      if (rawText.startsWith('```')) {
+        rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+      }
+
+      const data = JSON.parse(rawText);
+      let detectedDespensa = [];
+      let detectedMenu = [];
+
+      if (Array.isArray(data)) {
+        // Es un arreglo directo
+        data.forEach(item => {
+          if (item && typeof item === 'object') {
+            if ('articulo' in item) {
+              detectedDespensa.push(item);
+            } else if ('nombre' in item || 'platillo' in item || 'ingredientes' in item) {
+              detectedMenu.push({
+                nombre: item.nombre || item.platillo || 'Sin Nombre',
+                ingredientes: Array.isArray(item.ingredientes) ? item.ingredientes : []
+              });
+            }
+          }
+        });
+      } else if (data && typeof data === 'object') {
+        // Es un objeto estructurado
+        if (Array.isArray(data.despensa)) {
+          detectedDespensa = data.despensa;
+        } else if (data.articulo) {
+          detectedDespensa = [data];
+        }
+
+        if (Array.isArray(data.menu)) {
+          detectedMenu = data.menu;
+        } else if (Array.isArray(data.menus)) {
+          detectedMenu = data.menus;
+        } else if (Array.isArray(data.comidas)) {
+          detectedMenu = data.comidas;
+        } else if (data.nombre || data.platillo) {
+          detectedMenu = [{
+            nombre: data.nombre || data.platillo || 'Sin Nombre',
+            ingredientes: Array.isArray(data.ingredientes) ? data.ingredientes : []
+          }];
+        }
+      }
+
+      const despensaCount = detectedDespensa.length;
+      const menuCount = detectedMenu.length;
+      const isValid = despensaCount > 0 || menuCount > 0;
+
+      setParseStatus({
+        valid: isValid,
+        error: isValid ? '' : 'No se detectaron elementos válidos para Despensa ni Menú.',
+        despensaCount,
+        menuCount,
+        parsedData: { despensa: detectedDespensa, menu: detectedMenu }
+      });
+    } catch (err) {
+      setParseStatus({
+        valid: false,
+        error: 'JSON inválido: ' + err.message,
+        despensaCount: 0,
+        menuCount: 0,
+        parsedData: null
+      });
+    }
+  }, [jsonInput]);
+
+  // --- 3. ACCIONES DE DESPENSA ---
   const handleAddPantryItem = async (e) => {
     e.preventDefault();
     setLoading(true);
@@ -73,7 +181,7 @@ function App() {
         createdAt: new Date()
       });
       setShowPantryModal(false);
-      setNewPantryItem({ articulo: '', cantidad: 1, unidad: 'pz', origen: 'Walmart' }); // Reset
+      setNewPantryItem({ articulo: '', cantidad: 1, unidad: 'pz', origen: 'Walmart' });
     } catch (error) {
       console.error(error);
     } finally {
@@ -82,7 +190,7 @@ function App() {
   };
 
   const handleDeletePantryItem = async (e, id) => {
-    e.stopPropagation(); // Evitar activar el toggle de comprado
+    e.stopPropagation();
     if (confirm('¿Borrar este artículo?')) {
       await deleteDoc(doc(db, "despensa", id));
     }
@@ -92,8 +200,7 @@ function App() {
     await updateDoc(doc(db, "despensa", id), { comprado: !statusActual });
   };
 
-  // --- 3. ACCIONES DE MENÚ (Add Dish/Delete Dish/Add Ing/Del Ing) ---
-
+  // --- 4. ACCIONES DE MENÚ ---
   const handleAddDish = async (e) => {
     e.preventDefault();
     if (!newDishName.trim()) return;
@@ -142,15 +249,11 @@ function App() {
   };
 
   const handleDeleteIngredient = async (dishId, ingredientIndex) => {
-    // Para borrar de un array en Firestore necesitamos leer, filtrar y reescribir
-    // o usar arrayRemove si tenemos el objeto exacto. Filtrar es más seguro por índice.
     const dishRef = doc(db, "menus", dishId);
     const dishDoc = await getDoc(dishRef);
     if (dishDoc.exists()) {
       const currentIngredients = dishDoc.data().ingredientes || [];
       const updatedIngredients = currentIngredients.filter((_, index) => index !== ingredientIndex);
-      await updateDoc(dishRef, { ingredients: updatedIngredients }); // Firestore field match
-      // Nota: Si tu campo se llama 'ingredientes' en español en la BD:
       await updateDoc(dishRef, { ingredientes: updatedIngredients });
     }
   };
@@ -159,7 +262,107 @@ function App() {
     await updateDoc(doc(db, "menus", id), { preparado: !statusActual });
   };
 
-  // --- 4. CARGA MASIVA (CSV) - Mantenemos la lógica anterior ---
+  // --- 5. CARGA MASIVA DESDE CLIPBOARD (JSON) ---
+  const handlePasteFromClipboard = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        setJsonInput(text);
+      }
+    } catch (err) {
+      alert("No se pudo acceder al portapapeles directamente. Pega el texto manualmente en el recuadro.");
+    }
+  };
+
+  const handleCopyPrompt = () => {
+    navigator.clipboard.writeText(GEMINI_PROMPT_TEMPLATE);
+    setCopiedPrompt(true);
+    setTimeout(() => setCopiedPrompt(false), 2500);
+  };
+
+  const handleProcessClipboardImport = async () => {
+    if (!parseStatus.valid || !parseStatus.parsedData) return;
+    setLoading(true);
+
+    try {
+      const batch = writeBatch(db);
+      const { despensa, menu } = parseStatus.parsedData;
+
+      const shouldImportDespensa = (importTarget === 'auto' || importTarget === 'despensa') && despensa.length > 0;
+      const shouldImportMenu = (importTarget === 'auto' || importTarget === 'menu') && menu.length > 0;
+
+      if (!shouldImportDespensa && !shouldImportMenu) {
+        alert("No hay elementos seleccionados para importar con la configuración actual.");
+        setLoading(false);
+        return;
+      }
+
+      // Modo Reemplazar: eliminar documentos existentes antes de agregar
+      if (importMode === 'replace') {
+        if (shouldImportDespensa || importTarget === 'despensa') {
+          const pantrySnap = await getDocs(collection(db, "despensa"));
+          pantrySnap.docs.forEach(d => batch.delete(d.ref));
+        }
+        if (shouldImportMenu || importTarget === 'menu') {
+          const menuSnap = await getDocs(collection(db, "menus"));
+          menuSnap.docs.forEach(d => batch.delete(d.ref));
+        }
+      }
+
+      // Cargar Despensa
+      if (shouldImportDespensa) {
+        const pantryRef = collection(db, "despensa");
+        despensa.forEach(item => {
+          batch.set(doc(pantryRef), {
+            articulo: String(item.articulo || item.nombre || 'Artículo'),
+            cantidad: item.cantidad ?? 1,
+            unidad: String(item.unidad || 'pz'),
+            origen: String(item.origen || 'Walmart'),
+            comprado: Boolean(item.comprado || false),
+            createdAt: new Date()
+          });
+        });
+      }
+
+      // Cargar Menú
+      if (shouldImportMenu) {
+        const menuRef = collection(db, "menus");
+        menu.forEach(dish => {
+          const ingredientsCleaned = Array.isArray(dish.ingredientes)
+            ? dish.ingredientes.map(ing => ({
+                nombre: String(ing.nombre || ing.articulo || ''),
+                cantidad: ing.cantidad !== undefined ? String(ing.cantidad) : '',
+                unidad: String(ing.unidad || '')
+              }))
+            : [];
+
+          batch.set(doc(menuRef), {
+            nombre: String(dish.nombre || dish.platillo || 'Platillo Nuevo'),
+            preparado: Boolean(dish.preparado || false),
+            ingredientes: ingredientsCleaned
+          });
+        });
+      }
+
+      await batch.commit();
+
+      const details = [];
+      if (shouldImportDespensa) details.push(`${despensa.length} en Despensa`);
+      if (shouldImportMenu) details.push(`${menu.length} en Menú`);
+
+      alert(`✅ Carga completada (${importMode === 'replace' ? 'Reemplazado' : 'Agregado'}):\n- ` + details.join('\n- '));
+
+      setShowClipboardModal(false);
+      setJsonInput('');
+    } catch (err) {
+      console.error("Error al importar JSON:", err);
+      alert("Error al guardar en Firebase: " + err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // --- 6. CARGA MASIVA (CSV) ---
   const handleFileUpload = (event) => {
     const file = event.target.files[0];
     if (!file) return;
@@ -235,30 +438,38 @@ function App() {
         </div>
         {/* Lista */}
         <div className="p-4 max-w-md mx-auto">
-          {Object.keys(itemsPorOrigen).map(origen => (
-            <div key={origen} className="mb-6">
-              <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wider mb-2 ml-1">{origen}</h2>
-              <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                {itemsPorOrigen[origen].map((item) => (
-                  <div key={item.id} onClick={() => togglePantryItem(item.id, item.comprado)}
-                    className={`flex items-center justify-between p-4 border-b border-gray-50 last:border-0 active:bg-gray-50 cursor-pointer ${item.comprado ? 'bg-gray-50' : ''}`}>
-                    <div className="flex items-center gap-3 overflow-hidden">
-                      <div className={item.comprado ? "text-green-500 shrink-0" : "text-gray-300 shrink-0"}>
-                        {item.comprado ? <CheckCircle2 size={24} /> : <Circle size={24} />}
-                      </div>
-                      <div className="truncate">
-                        <p className={`font-medium text-base truncate ${item.comprado ? 'text-gray-400 line-through' : 'text-gray-800'}`}>{item.articulo}</p>
-                        <p className="text-xs text-gray-500">{item.cantidad} {item.unidad}</p>
-                      </div>
-                    </div>
-                    <button onClick={(e) => handleDeletePantryItem(e, item.id)} className="p-2 text-gray-300 hover:text-red-500 transition-colors">
-                      <Trash2 size={18} />
-                    </button>
-                  </div>
-                ))}
-              </div>
+          {Object.keys(itemsPorOrigen).length === 0 ? (
+            <div className="text-center py-12 text-gray-400">
+              <ShoppingCart size={48} className="mx-auto mb-2 opacity-50" />
+              <p className="font-medium text-gray-500">No hay artículos en la despensa</p>
+              <p className="text-xs text-gray-400 mt-1">Usa la importación por IA o agrega manualmente con el botón +</p>
             </div>
-          ))}
+          ) : (
+            Object.keys(itemsPorOrigen).map(origen => (
+              <div key={origen} className="mb-6">
+                <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wider mb-2 ml-1">{origen}</h2>
+                <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                  {itemsPorOrigen[origen].map((item) => (
+                    <div key={item.id} onClick={() => togglePantryItem(item.id, item.comprado)}
+                      className={`flex items-center justify-between p-4 border-b border-gray-50 last:border-0 active:bg-gray-50 cursor-pointer ${item.comprado ? 'bg-gray-50' : ''}`}>
+                      <div className="flex items-center gap-3 overflow-hidden">
+                        <div className={item.comprado ? "text-green-500 shrink-0" : "text-gray-300 shrink-0"}>
+                          {item.comprado ? <CheckCircle2 size={24} /> : <Circle size={24} />}
+                        </div>
+                        <div className="truncate">
+                          <p className={`font-medium text-base truncate ${item.comprado ? 'text-gray-400 line-through' : 'text-gray-800'}`}>{item.articulo}</p>
+                          <p className="text-xs text-gray-500">{item.cantidad} {item.unidad}</p>
+                        </div>
+                      </div>
+                      <button onClick={(e) => handleDeletePantryItem(e, item.id)} className="p-2 text-gray-300 hover:text-red-500 transition-colors">
+                        <Trash2 size={18} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
         </div>
       </div>
     );
@@ -267,45 +478,53 @@ function App() {
   const renderMenu = () => {
     return (
       <div className="p-4 max-w-md mx-auto pb-24">
-        <div className="space-y-4">
-          {menuItems.map(dish => (
-            <div key={dish.id} className={`bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden ${dish.preparado ? 'opacity-60' : ''}`}>
-              <div onClick={() => toggleMenuItem(dish.id, dish.preparado)} className="p-4 bg-orange-50 border-b border-orange-100 flex items-center justify-between cursor-pointer">
-                <div className="flex items-center gap-3 overflow-hidden">
-                  <div className="bg-orange-100 p-2 rounded-full text-orange-600 shrink-0"><ChefHat size={20} /></div>
-                  <h3 className={`font-bold text-lg truncate ${dish.preparado ? 'line-through text-gray-500' : 'text-gray-800'}`}>{dish.nombre}</h3>
-                </div>
-                <div className="flex items-center gap-2">
-                  <div className={dish.preparado ? "text-green-600" : "text-gray-300"}>
-                    {dish.preparado ? <CheckCircle2 size={28} /> : <Circle size={28} />}
+        {menuItems.length === 0 ? (
+          <div className="text-center py-12 text-gray-400">
+            <ChefHat size={48} className="mx-auto mb-2 opacity-50" />
+            <p className="font-medium text-gray-500">No hay platillos en el menú</p>
+            <p className="text-xs text-gray-400 mt-1">Usa la importación por IA o crea un platillo nuevo</p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {menuItems.map(dish => (
+              <div key={dish.id} className={`bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden ${dish.preparado ? 'opacity-60' : ''}`}>
+                <div onClick={() => toggleMenuItem(dish.id, dish.preparado)} className="p-4 bg-orange-50 border-b border-orange-100 flex items-center justify-between cursor-pointer">
+                  <div className="flex items-center gap-3 overflow-hidden">
+                    <div className="bg-orange-100 p-2 rounded-full text-orange-600 shrink-0"><ChefHat size={20} /></div>
+                    <h3 className={`font-bold text-lg truncate ${dish.preparado ? 'line-through text-gray-500' : 'text-gray-800'}`}>{dish.nombre}</h3>
                   </div>
-                  <button onClick={(e) => handleDeleteDish(e, dish.id)} className="p-2 text-orange-300 hover:text-red-500 z-10">
-                    <Trash2 size={20} />
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <div className={dish.preparado ? "text-green-600" : "text-gray-300"}>
+                      {dish.preparado ? <CheckCircle2 size={28} /> : <Circle size={28} />}
+                    </div>
+                    <button onClick={(e) => handleDeleteDish(e, dish.id)} className="p-2 text-orange-300 hover:text-red-500 z-10">
+                      <Trash2 size={20} />
+                    </button>
+                  </div>
+                </div>
+                <div className="p-4 bg-white relative">
+                  <div className="flex justify-between items-center mb-2">
+                    <p className="text-xs font-bold text-gray-400 uppercase">Ingredientes:</p>
+                    <button onClick={(e) => openIngredientModal(e, dish.id)} className="text-orange-600 bg-orange-50 px-2 py-1 rounded text-xs font-bold flex items-center gap-1">
+                      <Plus size={12} /> Agregar
+                    </button>
+                  </div>
+                  <ul className="space-y-2">
+                    {dish.ingredientes && dish.ingredientes.map((ing, idx) => (
+                      <li key={idx} className="flex items-center justify-between text-sm text-gray-600 border-b border-gray-50 last:border-0 pb-1 last:pb-0">
+                        <span>• {ing.nombre}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-gray-400 text-xs">{ing.cantidad} {ing.unidad}</span>
+                          <button onClick={() => handleDeleteIngredient(dish.id, idx)} className="text-gray-300 hover:text-red-400"><X size={14} /></button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               </div>
-              <div className="p-4 bg-white relative">
-                <div className="flex justify-between items-center mb-2">
-                  <p className="text-xs font-bold text-gray-400 uppercase">Ingredientes:</p>
-                  <button onClick={(e) => openIngredientModal(e, dish.id)} className="text-orange-600 bg-orange-50 px-2 py-1 rounded text-xs font-bold flex items-center gap-1">
-                    <Plus size={12} /> Agregar
-                  </button>
-                </div>
-                <ul className="space-y-2">
-                  {dish.ingredientes && dish.ingredientes.map((ing, idx) => (
-                    <li key={idx} className="flex items-center justify-between text-sm text-gray-600 border-b border-gray-50 last:border-0 pb-1 last:pb-0">
-                      <span>• {ing.nombre}</span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-gray-400 text-xs">{ing.cantidad} {ing.unidad}</span>
-                        <button onClick={() => handleDeleteIngredient(dish.id, idx)} className="text-gray-300 hover:text-red-400"><X size={14} /></button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
       </div>
     );
   };
@@ -321,9 +540,18 @@ function App() {
           </div>
           <h1 className="text-xl font-bold text-gray-800">{activeTab === 'despensa' ? "Yoyo's Despensa" : "Menú Quincenal"}</h1>
         </div>
-        <div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowClipboardModal(true)}
+            disabled={loading}
+            className="flex items-center gap-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white px-3 py-2 rounded-lg text-xs sm:text-sm font-semibold shadow-sm active:scale-95 transition-all"
+            title="Importar JSON desde Portapapeles (IA)"
+          >
+            <Sparkles size={16} />
+            <span>Cargar JSON</span>
+          </button>
           <input type="file" accept=".csv" className="hidden" ref={fileInputRef} onChange={handleFileUpload} />
-          <button onClick={() => fileInputRef.current.click()} disabled={loading} className="flex items-center gap-2 bg-gray-900 text-white px-3 py-2 rounded-lg text-sm active:scale-95 transition-transform">
+          <button onClick={() => fileInputRef.current.click()} disabled={loading} className="flex items-center gap-2 bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-2 rounded-lg text-xs sm:text-sm font-medium active:scale-95 transition-transform" title="Subir CSV">
             {loading ? '...' : <Upload size={16} />}
           </button>
         </div>
@@ -350,23 +578,164 @@ function App() {
         </button>
       </nav>
 
+      {/* MODAL IMPORTACIÓN DE CLIPBOARD / JSON (IA) */}
+      {showClipboardModal && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl w-full max-w-lg p-6 shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center mb-3 border-b border-gray-100 pb-3">
+              <div className="flex items-center gap-2 text-indigo-600">
+                <Sparkles size={22} />
+                <h3 className="text-lg font-bold text-gray-800">Cargar JSON (Portapapeles / Gemini)</h3>
+              </div>
+              <button onClick={() => setShowClipboardModal(false)} className="text-gray-400 hover:text-gray-600 p-1">
+                <X size={20} />
+              </button>
+            </div>
+
+            {/* Helper Gemini Prompt */}
+            <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-3 mb-4 flex items-center justify-between">
+              <div className="text-xs text-indigo-900 pr-2">
+                <span className="font-bold block text-indigo-950 mb-0.5">¿Usando Gemini o ChatGPT?</span>
+                Copia nuestra plantilla de prompt para pedirle a la IA el formato perfecto.
+              </div>
+              <button 
+                onClick={handleCopyPrompt} 
+                className="bg-indigo-600 hover:bg-indigo-700 text-white text-xs px-3 py-2 rounded-lg shrink-0 flex items-center gap-1 font-semibold transition-colors shadow-sm"
+              >
+                {copiedPrompt ? <Check size={14} /> : <Copy size={14} />}
+                <span>{copiedPrompt ? '¡Copiado!' : 'Copiar Prompt'}</span>
+              </button>
+            </div>
+
+            {/* Area de Texto JSON */}
+            <div className="mb-4">
+              <div className="flex justify-between items-center mb-1">
+                <label className="text-xs font-bold text-gray-600 uppercase">Pega el JSON aquí:</label>
+                <button 
+                  type="button" 
+                  onClick={handlePasteFromClipboard} 
+                  className="text-xs text-blue-600 hover:text-blue-800 font-semibold flex items-center gap-1"
+                >
+                  <ClipboardPaste size={14} /> Pegar del Portapapeles
+                </button>
+              </div>
+              <textarea
+                rows={6}
+                value={jsonInput}
+                onChange={e => setJsonInput(e.target.value)}
+                placeholder='{\n  "despensa": [{ "articulo": "Manzanas", "cantidad": 6, "origen": "Costco" }],\n  "menu": [{ "nombre": "Ensalada", "ingredientes": [...] }]\n}'
+                className="w-full border border-gray-300 p-3 rounded-xl bg-gray-50 font-mono text-xs focus:ring-2 focus:ring-indigo-500 outline-none transition-all"
+              />
+            </div>
+
+            {/* Estado de Validación */}
+            {jsonInput.trim() !== '' && (
+              <div className="mb-4">
+                {parseStatus.valid ? (
+                  <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl p-3 text-xs flex items-center justify-between">
+                    <div className="flex items-center gap-2 font-medium">
+                      <CheckCircle2 size={18} className="text-emerald-600 shrink-0" />
+                      <span>Estructura JSON válida detectada</span>
+                    </div>
+                    <div className="flex gap-2 font-bold text-xs">
+                      {parseStatus.despensaCount > 0 && <span className="bg-emerald-200 text-emerald-900 px-2 py-0.5 rounded-full">Despensa: {parseStatus.despensaCount}</span>}
+                      {parseStatus.menuCount > 0 && <span className="bg-amber-200 text-amber-900 px-2 py-0.5 rounded-full">Menú: {parseStatus.menuCount}</span>}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-3 text-xs flex items-start gap-2">
+                    <AlertCircle size={18} className="text-red-500 shrink-0 mt-0.5" />
+                    <span>{parseStatus.error}</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Opciones de Carga */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5 bg-gray-50 p-3.5 rounded-xl border border-gray-100">
+              {/* Modo: Agregar vs Reemplazar */}
+              <div>
+                <label className="text-xs font-bold text-gray-600 uppercase block mb-1.5">Modo de Carga</label>
+                <div className="space-y-1.5">
+                  <label className="flex items-center gap-2 text-xs font-medium cursor-pointer text-gray-700">
+                    <input 
+                      type="radio" 
+                      name="importMode" 
+                      value="append" 
+                      checked={importMode === 'append'} 
+                      onChange={() => setImportMode('append')}
+                      className="text-indigo-600 focus:ring-indigo-500"
+                    />
+                    <span>Anexar / Agregar a lo existente</span>
+                  </label>
+                  <label className="flex items-center gap-2 text-xs font-medium cursor-pointer text-red-600">
+                    <input 
+                      type="radio" 
+                      name="importMode" 
+                      value="replace" 
+                      checked={importMode === 'replace'} 
+                      onChange={() => setImportMode('replace')}
+                      className="text-red-600 focus:ring-red-500"
+                    />
+                    <span>Reemplazar lista actual</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* Destino */}
+              <div>
+                <label className="text-xs font-bold text-gray-600 uppercase block mb-1.5">Destino</label>
+                <select 
+                  value={importTarget} 
+                  onChange={e => setImportTarget(e.target.value)}
+                  className="w-full text-xs border border-gray-300 rounded-lg p-2 bg-white outline-none focus:ring-2 focus:ring-indigo-500"
+                >
+                  <option value="auto">Automático / Homologado</option>
+                  <option value="despensa">Sólo Despensa</option>
+                  <option value="menu">Sólo Menú</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Botones de Acción */}
+            <div className="flex gap-2">
+              <button 
+                type="button" 
+                onClick={() => setShowClipboardModal(false)} 
+                className="flex-1 py-2.5 border border-gray-300 text-gray-600 rounded-xl font-medium text-sm hover:bg-gray-50 transition-colors"
+              >
+                Cancelar
+              </button>
+              <button 
+                type="button" 
+                onClick={handleProcessClipboardImport} 
+                disabled={!parseStatus.valid || loading}
+                className="flex-1 py-2.5 bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 disabled:opacity-50 text-white rounded-xl font-bold text-sm shadow-md transition-all flex items-center justify-center gap-2"
+              >
+                {loading ? 'Guardando...' : 'Importar Datos'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* MODAL DESPENSA */}
       {showPantryModal && (
         <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm">
           <div className="bg-white rounded-2xl w-full max-w-sm p-6 shadow-2xl">
             <h3 className="text-lg font-bold mb-4">Agregar a Despensa</h3>
             <form onSubmit={handleAddPantryItem} className="space-y-3">
-              <input autoFocus placeholder="Artículo (ej. Leche)" value={newPantryItem.articulo} onChange={e => setNewPantryItem({...newPantryItem, articulo: e.target.value})} className="w-full border p-3 rounded-lg bg-gray-50 outline-blue-500" required />
+              <input autoFocus placeholder="Artículo (ej. Leche)" value={newPantryItem.articulo} onChange={e => setNewPantryItem({...newPantryItem, articulo: e.target.value})} className="w-full border p-3 rounded-lg bg-gray-50 outline-blue-500 text-sm" required />
               <div className="flex gap-2">
-                <input type="number" placeholder="Cant." value={newPantryItem.cantidad} onChange={e => setNewPantryItem({...newPantryItem, cantidad: e.target.value})} className="w-1/3 border p-3 rounded-lg bg-gray-50 outline-blue-500" />
-                <input placeholder="Unidad" value={newPantryItem.unidad} onChange={e => setNewPantryItem({...newPantryItem, unidad: e.target.value})} className="w-2/3 border p-3 rounded-lg bg-gray-50 outline-blue-500" />
+                <input type="number" placeholder="Cant." value={newPantryItem.cantidad} onChange={e => setNewPantryItem({...newPantryItem, cantidad: e.target.value})} className="w-1/3 border p-3 rounded-lg bg-gray-50 outline-blue-500 text-sm" />
+                <input placeholder="Unidad" value={newPantryItem.unidad} onChange={e => setNewPantryItem({...newPantryItem, unidad: e.target.value})} className="w-2/3 border p-3 rounded-lg bg-gray-50 outline-blue-500 text-sm" />
               </div>
-              <select value={newPantryItem.origen} onChange={e => setNewPantryItem({...newPantryItem, origen: e.target.value})} className="w-full border p-3 rounded-lg bg-gray-50 outline-blue-500">
+              <select value={newPantryItem.origen} onChange={e => setNewPantryItem({...newPantryItem, origen: e.target.value})} className="w-full border p-3 rounded-lg bg-gray-50 outline-blue-500 text-sm">
                 {['Walmart', 'Costco', 'Mercado', 'Carniceria', 'Abarrotes', 'Oxxo'].map(o => <option key={o} value={o}>{o}</option>)}
               </select>
               <div className="flex gap-2 pt-2">
-                <button type="button" onClick={() => setShowPantryModal(false)} className="flex-1 py-3 text-gray-500 font-medium">Cancelar</button>
-                <button type="submit" className="flex-1 py-3 bg-blue-600 text-white rounded-xl font-bold">Guardar</button>
+                <button type="button" onClick={() => setShowPantryModal(false)} className="flex-1 py-3 text-gray-500 font-medium text-sm">Cancelar</button>
+                <button type="submit" className="flex-1 py-3 bg-blue-600 text-white rounded-xl font-bold text-sm">Guardar</button>
               </div>
             </form>
           </div>
@@ -379,10 +748,10 @@ function App() {
           <div className="bg-white rounded-2xl w-full max-w-sm p-6 shadow-2xl">
             <h3 className="text-lg font-bold mb-4">Nuevo Platillo</h3>
             <form onSubmit={handleAddDish} className="space-y-4">
-              <input autoFocus placeholder="Nombre del platillo" value={newDishName} onChange={e => setNewDishName(e.target.value)} className="w-full border p-3 rounded-lg bg-gray-50 outline-orange-500" required />
+              <input autoFocus placeholder="Nombre del platillo" value={newDishName} onChange={e => setNewDishName(e.target.value)} className="w-full border p-3 rounded-lg bg-gray-50 outline-orange-500 text-sm" required />
               <div className="flex gap-2 pt-2">
-                <button type="button" onClick={() => setShowMenuModal(false)} className="flex-1 py-3 text-gray-500 font-medium">Cancelar</button>
-                <button type="submit" className="flex-1 py-3 bg-orange-500 text-white rounded-xl font-bold">Crear</button>
+                <button type="button" onClick={() => setShowMenuModal(false)} className="flex-1 py-3 text-gray-500 font-medium text-sm">Cancelar</button>
+                <button type="submit" className="flex-1 py-3 bg-orange-500 text-white rounded-xl font-bold text-sm">Crear</button>
               </div>
             </form>
           </div>
@@ -395,14 +764,14 @@ function App() {
           <div className="bg-white rounded-2xl w-full max-w-sm p-6 shadow-2xl">
             <h3 className="text-lg font-bold mb-4">Agregar Ingrediente</h3>
             <form onSubmit={handleAddIngredientToDish} className="space-y-3">
-              <input autoFocus placeholder="Ingrediente (ej. Tomate)" value={newIngredient.nombre} onChange={e => setNewIngredient({...newIngredient, nombre: e.target.value})} className="w-full border p-3 rounded-lg bg-gray-50 outline-orange-500" required />
+              <input autoFocus placeholder="Ingrediente (ej. Tomate)" value={newIngredient.nombre} onChange={e => setNewIngredient({...newIngredient, nombre: e.target.value})} className="w-full border p-3 rounded-lg bg-gray-50 outline-orange-500 text-sm" required />
               <div className="flex gap-2">
-                <input placeholder="Cantidad" value={newIngredient.cantidad} onChange={e => setNewIngredient({...newIngredient, cantidad: e.target.value})} className="w-1/2 border p-3 rounded-lg bg-gray-50 outline-orange-500" />
-                <input placeholder="Unidad" value={newIngredient.unidad} onChange={e => setNewIngredient({...newIngredient, unidad: e.target.value})} className="w-1/2 border p-3 rounded-lg bg-gray-50 outline-orange-500" />
+                <input placeholder="Cantidad" value={newIngredient.cantidad} onChange={e => setNewIngredient({...newIngredient, cantidad: e.target.value})} className="w-1/2 border p-3 rounded-lg bg-gray-50 outline-orange-500 text-sm" />
+                <input placeholder="Unidad" value={newIngredient.unidad} onChange={e => setNewIngredient({...newIngredient, unidad: e.target.value})} className="w-1/2 border p-3 rounded-lg bg-gray-50 outline-orange-500 text-sm" />
               </div>
               <div className="flex gap-2 pt-2">
-                <button type="button" onClick={() => setShowIngredientModal(false)} className="flex-1 py-3 text-gray-500 font-medium">Cancelar</button>
-                <button type="submit" className="flex-1 py-3 bg-orange-500 text-white rounded-xl font-bold">Agregar</button>
+                <button type="button" onClick={() => setShowIngredientModal(false)} className="flex-1 py-3 text-gray-500 font-medium text-sm">Cancelar</button>
+                <button type="submit" className="flex-1 py-3 bg-orange-500 text-white rounded-xl font-bold text-sm">Agregar</button>
               </div>
             </form>
           </div>
